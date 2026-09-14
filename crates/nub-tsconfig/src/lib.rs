@@ -917,9 +917,11 @@ fn resolve_from_package_json(pkg_json_path: &str, subpath: &str, direct: bool) -
     )
 }
 
-/// Minimal subset of `resolve-pkg-maps`'s `resolveExports` covering the shapes a
-/// `@tsconfig/*` package uses: a `"."`/subpath key whose value is a string or a
-/// conditions object. Returns the first matching string target, or `None` when no
+/// Minimal subset of `resolve-pkg-maps`'s `resolveExports`: exact subpath keys,
+/// then a single-`*` pattern (longest static prefix, then longer key), with every
+/// `*` in the selected target replaced by the capture. A `"."` key or a bare
+/// conditions object still applies only to the empty subpath. Returns the matching
+/// string target, or `None` when the selected entry is null, unmatched, or no
 /// condition matched (get-tsconfig treats that as the `false` short-circuit).
 fn resolve_exports(exports: &Value, subpath: &str, conditions: &[&str]) -> Option<String> {
     let key = if subpath.is_empty() {
@@ -941,13 +943,75 @@ fn resolve_exports(exports: &Value, subpath: &str, conditions: &[&str]) -> Optio
             // Subpath map (keys starting with ".") vs a bare conditions object.
             let is_subpath_map = map.keys().any(|k| k.starts_with('.'));
             if is_subpath_map {
-                let target = map.get(&key)?;
-                resolve_conditional(target, conditions)
+                resolve_exports_subpath(map, &key, conditions)
             } else {
                 resolve_conditional(exports, conditions)
             }
         }
         _ => None,
+    }
+}
+
+/// Exact key first (even when its target is null or unresolved), then the most
+/// specific single-star pattern. A selected miss does not fall through to a
+/// broader pattern — that is the Node/get-tsconfig exports boundary.
+fn resolve_exports_subpath(
+    map: &Map<String, Value>,
+    key: &str,
+    conditions: &[&str],
+) -> Option<String> {
+    if let Some(target) = map.get(key) {
+        return resolve_conditional(target, conditions);
+    }
+
+    let mut best_pattern: Option<&str> = None;
+    let mut best: Option<(&Value, &str)> = None;
+    for (pattern, target) in map {
+        let Some(capture) = match_single_star_export(pattern, key) else {
+            continue;
+        };
+        if best_pattern.is_none_or(|current| pattern_is_more_specific(pattern, current)) {
+            best_pattern = Some(pattern);
+            best = Some((target, capture));
+        }
+    }
+    let (target, capture) = best?;
+    Some(resolve_conditional(target, conditions)?.replace('*', capture))
+}
+
+/// Node/`resolve-pkg-maps` single-star match: prefix + suffix, capture may contain
+/// slashes, empty captures do not match. Keys with more than one `*` are ignored.
+fn match_single_star_export<'a>(pattern: &str, request: &'a str) -> Option<&'a str> {
+    let star = pattern.find('*')?;
+    if pattern[star + 1..].contains('*') {
+        return None;
+    }
+    let prefix = &pattern[..star];
+    let suffix = &pattern[star + 1..];
+    if request.len() < prefix.len() + suffix.len()
+        || !request.starts_with(prefix)
+        || !request.ends_with(suffix)
+    {
+        return None;
+    }
+    let capture = &request[prefix.len()..request.len() - suffix.len()];
+    if capture.is_empty() {
+        None
+    } else {
+        Some(capture)
+    }
+}
+
+/// `resolve-pkg-maps` `hasHigherSpecificity(current, candidate)`: later `*` (longer
+/// static prefix) wins; equal prefixes prefer the longer key. Insertion order is
+/// only a tie-break.
+fn pattern_is_more_specific(candidate: &str, current: &str) -> bool {
+    let cand_star = candidate.find('*').unwrap_or(candidate.len());
+    let cur_star = current.find('*').unwrap_or(current.len());
+    if cand_star == cur_star {
+        candidate.len() > current.len()
+    } else {
+        cand_star > cur_star
     }
 }
 
@@ -1391,7 +1455,11 @@ mod tests {
     fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         for (name, body) in files {
-            std::fs::write(dir.path().join(name), body).unwrap();
+            let path = dir.path().join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, body).unwrap();
         }
         dir
     }
@@ -1579,5 +1647,375 @@ mod tests {
         ]);
         assert_eq!(read(&dir), vec!["ok"]);
         assert!(diags(&dir).is_empty());
+    }
+
+    /// #804: a wildcard-only `exports` map used to miss, even when the JSON file
+    /// the pattern names was on disk. Public entry points must inherit both the
+    /// base's `customConditions` and the transform slice.
+    #[test]
+    fn wildcard_package_exports_inherit_conditions_and_transform_options() {
+        let dir = project(&[
+            (
+                "node_modules/pkg/package.json",
+                r#"{ "exports": { "./ts/*": "./ts/*.json" } }"#,
+            ),
+            (
+                "node_modules/pkg/ts/base.json",
+                r#"{ "compilerOptions": {
+                       "customConditions": ["from-pkg"],
+                       "jsx": "react-jsx",
+                       "jsxImportSource": "preact",
+                       "experimentalDecorators": true
+                     } }"#,
+            ),
+            ("tsconfig.json", r#"{ "extends": "pkg/ts/base" }"#),
+        ]);
+        assert!(diags(&dir).is_empty(), "got {:?}", diags(&dir));
+        assert_eq!(read(&dir), vec!["from-pkg"]);
+        let loaded = super::load_tsconfig(&dir.path().to_string_lossy(), None);
+        let opts = loaded
+            .compiler_options
+            .expect("the extended config should supply transform options");
+        assert_eq!(opts.jsx.as_deref(), Some("react-jsx"));
+        assert_eq!(opts.jsx_import_source.as_deref(), Some("preact"));
+        assert_eq!(opts.experimental_decorators, Some(true));
+    }
+
+    /// Astro ships `./tsconfigs/*` and `./tsconfigs/*.json`. Both declaration
+    /// orders, and distinct payloads, so a `.json` request cannot silently take
+    /// the extensionless pattern.
+    #[test]
+    fn astro_style_paired_wildcard_keys_resolve_extensionless_and_json_requests() {
+        let files_for = |exports: &str, request: &str| -> Vec<(String, String)> {
+            vec![
+                (
+                    "node_modules/astro/package.json".into(),
+                    format!(r#"{{ "exports": {exports} }}"#),
+                ),
+                (
+                    "node_modules/astro/plain/strict.json".into(),
+                    r#"{ "compilerOptions": { "customConditions": ["from-plain"] } }"#.into(),
+                ),
+                (
+                    "node_modules/astro/json/strict.json".into(),
+                    r#"{ "compilerOptions": { "customConditions": ["from-json"] } }"#.into(),
+                ),
+                (
+                    "tsconfig.json".into(),
+                    format!(r#"{{ "extends": "astro/{request}" }}"#),
+                ),
+            ]
+        };
+        let run = |exports: &str, request: &str, expect: &str| {
+            let owned = files_for(exports, request);
+            let files: Vec<(&str, &str)> = owned
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            let dir = project(&files);
+            assert!(
+                diags(&dir).is_empty(),
+                "exports {exports} request {request}: {:?}",
+                diags(&dir)
+            );
+            assert_eq!(
+                read(&dir),
+                vec![expect],
+                "exports {exports} request {request}"
+            );
+        };
+
+        let json_first =
+            r#"{ "./tsconfigs/*.json": "./json/*.json", "./tsconfigs/*": "./plain/*.json" }"#;
+        let star_first =
+            r#"{ "./tsconfigs/*": "./plain/*.json", "./tsconfigs/*.json": "./json/*.json" }"#;
+        for exports in [json_first, star_first] {
+            run(exports, "tsconfigs/strict", "from-plain");
+            run(exports, "tsconfigs/strict.json", "from-json");
+        }
+    }
+
+    /// Exact keys beat matching patterns; longer static prefixes beat broader
+    /// ones; longer suffixes break equal-prefix ties. Nested captures, scoped
+    /// names, a repeated star in the target, and a non-matching suffix ride the
+    /// same matcher.
+    #[test]
+    fn export_pattern_specificity_and_capture_shapes() {
+        let dir = project(&[
+            (
+                "node_modules/pkg/package.json",
+                r#"{ "exports": {
+                       "./ts/base": "./exact.json",
+                       "./ts/foo/*": "./narrow/*.json",
+                       "./ts/*": "./broad/*.json"
+                     } }"#,
+            ),
+            (
+                "node_modules/pkg/exact.json",
+                r#"{ "compilerOptions": { "customConditions": ["from-exact"] } }"#,
+            ),
+            (
+                "node_modules/pkg/broad/base.json",
+                r#"{ "compilerOptions": { "customConditions": ["from-broad"] } }"#,
+            ),
+            (
+                "node_modules/pkg/narrow/bar.json",
+                r#"{ "compilerOptions": { "customConditions": ["from-narrow"] } }"#,
+            ),
+            (
+                "node_modules/pkg/broad/foo/bar.json",
+                r#"{ "compilerOptions": { "customConditions": ["from-broad-nested"] } }"#,
+            ),
+            ("tsconfig.json", r#"{ "extends": "pkg/ts/base" }"#),
+        ]);
+        assert_eq!(read(&dir), vec!["from-exact"]);
+        assert!(diags(&dir).is_empty());
+
+        let dir = project(&[
+            (
+                "node_modules/pkg/package.json",
+                r#"{ "exports": {
+                       "./ts/foo/*": "./narrow/*.json",
+                       "./ts/*": "./broad/*.json"
+                     } }"#,
+            ),
+            (
+                "node_modules/pkg/narrow/bar.json",
+                r#"{ "compilerOptions": { "customConditions": ["from-narrow"] } }"#,
+            ),
+            (
+                "node_modules/pkg/broad/foo/bar.json",
+                r#"{ "compilerOptions": { "customConditions": ["from-broad"] } }"#,
+            ),
+            ("tsconfig.json", r#"{ "extends": "pkg/ts/foo/bar" }"#),
+        ]);
+        assert_eq!(read(&dir), vec!["from-narrow"]);
+
+        let dir = project(&[
+            (
+                "node_modules/pkg/package.json",
+                r#"{ "exports": { "./ts/*": "./out/*.json" } }"#,
+            ),
+            (
+                "node_modules/pkg/out/nested/path.json",
+                r#"{ "compilerOptions": { "customConditions": ["from-nested"] } }"#,
+            ),
+            ("tsconfig.json", r#"{ "extends": "pkg/ts/nested/path" }"#),
+        ]);
+        assert_eq!(read(&dir), vec!["from-nested"]);
+
+        let dir = project(&[
+            (
+                "node_modules/@org/pkg/package.json",
+                r#"{ "exports": { "./ts/*": "./ts/*.json" } }"#,
+            ),
+            (
+                "node_modules/@org/pkg/ts/base.json",
+                r#"{ "compilerOptions": { "customConditions": ["from-scoped"] } }"#,
+            ),
+            ("tsconfig.json", r#"{ "extends": "@org/pkg/ts/base" }"#),
+        ]);
+        assert_eq!(read(&dir), vec!["from-scoped"]);
+
+        let dir = project(&[
+            (
+                "node_modules/pkg/package.json",
+                r#"{ "exports": { "./ts/*": "./a/*/b/*.json" } }"#,
+            ),
+            (
+                "node_modules/pkg/a/x/b/x.json",
+                r#"{ "compilerOptions": { "customConditions": ["from-repeated"] } }"#,
+            ),
+            ("tsconfig.json", r#"{ "extends": "pkg/ts/x" }"#),
+        ]);
+        assert_eq!(read(&dir), vec!["from-repeated"]);
+
+        let dir = project(&[
+            (
+                "node_modules/pkg/package.json",
+                r#"{ "exports": { "./ts/*.json": "./ts/*.json" } }"#,
+            ),
+            (
+                "node_modules/pkg/ts/base.json",
+                r#"{ "compilerOptions": { "customConditions": ["should-not-load"] } }"#,
+            ),
+            ("tsconfig.json", r#"{ "extends": "pkg/ts/base" }"#),
+        ]);
+        assert!(
+            !read(&dir).iter().any(|c| c == "should-not-load"),
+            "a non-matching suffix must not take the `.json` pattern; got {:?}",
+            read(&dir)
+        );
+        assert!(
+            diags(&dir).iter().any(|d| d.contains("pkg/ts/base")),
+            "expected a diagnostic naming the extends entry; got {:?}",
+            diags(&dir)
+        );
+    }
+
+    /// Wildcard keys still go through the existing string / require+types /
+    /// array resolver. Exact-only and no-`exports` packages keep their previous
+    /// answers; this must not broaden conditional semantics.
+    #[test]
+    fn wildcard_export_targets_use_the_existing_conditional_and_array_resolver() {
+        let dir = project(&[
+            (
+                "node_modules/pkg/package.json",
+                r#"{ "exports": { "./ts/*": {
+                       "require": "./cjs/*.json",
+                       "types": "./types/*.json",
+                       "default": "./esm/*.json"
+                     } } }"#,
+            ),
+            (
+                "node_modules/pkg/cjs/base.json",
+                r#"{ "compilerOptions": { "customConditions": ["from-require"] } }"#,
+            ),
+            (
+                "node_modules/pkg/types/base.json",
+                r#"{ "compilerOptions": { "customConditions": ["from-types"] } }"#,
+            ),
+            (
+                "node_modules/pkg/esm/base.json",
+                r#"{ "compilerOptions": { "customConditions": ["from-default"] } }"#,
+            ),
+            ("tsconfig.json", r#"{ "extends": "pkg/ts/base" }"#),
+        ]);
+        assert_eq!(read(&dir), vec!["from-require"]);
+        assert!(diags(&dir).is_empty());
+
+        let dir = project(&[
+            (
+                "node_modules/pkg/package.json",
+                r#"{ "exports": { "./ts/*": [
+                       { "import": "./esm/*.json" },
+                       "./hit/*.json"
+                     ] } }"#,
+            ),
+            (
+                "node_modules/pkg/esm/base.json",
+                r#"{ "compilerOptions": { "customConditions": ["from-import"] } }"#,
+            ),
+            (
+                "node_modules/pkg/hit/base.json",
+                r#"{ "compilerOptions": { "customConditions": ["from-array"] } }"#,
+            ),
+            ("tsconfig.json", r#"{ "extends": "pkg/ts/base" }"#),
+        ]);
+        assert_eq!(read(&dir), vec!["from-array"]);
+
+        let dir = project(&[
+            (
+                "node_modules/pkg/package.json",
+                r#"{ "exports": { "./tsconfig.json": "./tsconfig.json" } }"#,
+            ),
+            (
+                "node_modules/pkg/tsconfig.json",
+                r#"{ "compilerOptions": { "customConditions": ["from-exact"] } }"#,
+            ),
+            ("tsconfig.json", r#"{ "extends": "pkg/tsconfig.json" }"#),
+        ]);
+        assert_eq!(read(&dir), vec!["from-exact"]);
+
+        let dir = project(&[
+            ("node_modules/pkg/package.json", r#"{ "name": "pkg" }"#),
+            (
+                "node_modules/pkg/ts/base.json",
+                r#"{ "compilerOptions": { "customConditions": ["from-fs"] } }"#,
+            ),
+            ("tsconfig.json", r#"{ "extends": "pkg/ts/base" }"#),
+        ]);
+        assert_eq!(read(&dir), vec!["from-fs"]);
+    }
+
+    /// Null exact/pattern targets and an unmatched exports map must not fall
+    /// through to a file sitting at the naive path. A matched export that
+    /// points at a missing file stays a diagnostic.
+    #[test]
+    fn unresolved_exports_do_not_fall_through_to_a_file_on_disk() {
+        let dir = project(&[
+            (
+                "node_modules/pkg/package.json",
+                r#"{ "exports": { "./ts/base": null, "./ts/*": "./ts/*.json" } }"#,
+            ),
+            (
+                "node_modules/pkg/ts/base.json",
+                r#"{ "compilerOptions": { "customConditions": ["should-not-load"] } }"#,
+            ),
+            ("tsconfig.json", r#"{ "extends": "pkg/ts/base" }"#),
+        ]);
+        assert!(
+            !read(&dir).iter().any(|c| c == "should-not-load"),
+            "a null exact target must not fall through to a pattern or the file; got {:?}",
+            read(&dir)
+        );
+        assert!(
+            diags(&dir).iter().any(|d| d.contains("pkg/ts/base")),
+            "expected a diagnostic; got {:?}",
+            diags(&dir)
+        );
+
+        let dir = project(&[
+            (
+                "node_modules/pkg/package.json",
+                r#"{ "exports": { "./secret/*": null, "./ts/*": "./ts/*.json" } }"#,
+            ),
+            (
+                "node_modules/pkg/secret/x.json",
+                r#"{ "compilerOptions": { "customConditions": ["should-not-load"] } }"#,
+            ),
+            (
+                "node_modules/pkg/ts/x.json",
+                r#"{ "compilerOptions": { "customConditions": ["from-ts"] } }"#,
+            ),
+            ("tsconfig.json", r#"{ "extends": "pkg/secret/x" }"#),
+        ]);
+        assert!(
+            !read(&dir)
+                .iter()
+                .any(|c| c == "should-not-load" || c == "from-ts"),
+            "a null pattern must not fall through to a broader pattern or the file; got {:?}",
+            read(&dir)
+        );
+        assert!(
+            diags(&dir).iter().any(|d| d.contains("pkg/secret/x")),
+            "expected a diagnostic; got {:?}",
+            diags(&dir)
+        );
+
+        let dir = project(&[
+            (
+                "node_modules/pkg/package.json",
+                r#"{ "exports": { "./other/*": "./other/*.json" } }"#,
+            ),
+            (
+                "node_modules/pkg/ts/base.json",
+                r#"{ "compilerOptions": { "customConditions": ["should-not-load"] } }"#,
+            ),
+            ("tsconfig.json", r#"{ "extends": "pkg/ts/base" }"#),
+        ]);
+        assert!(
+            !read(&dir).iter().any(|c| c == "should-not-load"),
+            "an unmatched exports map must not fall through to the on-disk file; got {:?}",
+            read(&dir)
+        );
+        assert!(
+            diags(&dir).iter().any(|d| d.contains("pkg/ts/base")),
+            "expected a diagnostic; got {:?}",
+            diags(&dir)
+        );
+
+        let dir = project(&[
+            (
+                "node_modules/pkg/package.json",
+                r#"{ "exports": { "./ts/*": "./elsewhere/*.json" } }"#,
+            ),
+            ("tsconfig.json", r#"{ "extends": "pkg/ts/base" }"#),
+        ]);
+        assert!(
+            diags(&dir).iter().any(|d| d.contains("pkg/ts/base")),
+            "a matched export pointing at a missing file must stay a diagnostic; got {:?}",
+            diags(&dir)
+        );
     }
 }

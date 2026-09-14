@@ -23,7 +23,7 @@ A TS project that uses `paths` is therefore not portable across runners by defau
 
 The behavior to match, in priority order, per the TS handbook:
 
-1. **Read tsconfig.** Find the nearest `tsconfig.json` walking up from the source file. Resolve `extends` chains, which can transitively pull in other configs.
+1. **Read tsconfig.** Find the nearest `tsconfig.json` walking up from the source file. Resolve `extends` chains, which can transitively pull in other configs, including package specifiers resolved through `node_modules` and that package's `exports` map.
 2. **`baseUrl`** (deprecated in TS 5.0 but still widely used). Anchors relative paths in `paths` values. Default: directory of the tsconfig that defined `paths`.
 3. **Apply `paths` mappings.** Each key is a pattern with at most one `*` wildcard; each value is an array of replacement templates with at most one `*`. Patterns try in declaration order, with more-specific patterns evaluated first per the TS "longest-match" rule, and each pattern's replacements try in order.
 4. **Resolve the substituted path** as a file relative to `baseUrl`, or to the tsconfig directory if no `baseUrl`. Apply the normal extensionless-probing rules (per [[research/module-resolution#Candidate probing: dynamic ordering by parent|`module-resolution.md`]]).
@@ -43,7 +43,15 @@ Edge cases tsc handles that runners frequently get wrong:
 - TS project references: a referenced project's `paths` are not inherited by the referencing project; each project is resolved against its own tsconfig.
 - Trailing-slash and case-sensitivity subtleties on Windows / macOS.
 
-The `get-tsconfig` package (MIT, by tsx's author) is the canonical JS implementation and is battle-tested against tsc's behavior. Treat it as the reference implementation for correctness, even if logic is eventually ported to Rust.
+The `get-tsconfig` package (MIT, by tsx's author) is the canonical JS implementation and is battle-tested against tsc's behavior. Treat it as the reference implementation for correctness, even if logic is eventually ported to Rust. The in-tree port is `nub-tsconfig` and pins get-tsconfig 4.14.0.
+
+## Package `extends` and exports
+
+Package-style `extends` (`"extends": "astro/tsconfigs/strict"`) is resolved by walking to `node_modules/<pkg>` and reading that package's `exports` map, not by probing a file of the same name on disk.
+
+Nub's port ([[crates/nub-tsconfig/src/lib.rs#resolve_exports]]) mirrors get-tsconfig 4.14.0 / `resolve-pkg-maps`: conditions `require` then `types`, exact subpath keys first, then a single-`*` pattern. The selected pattern is the one with the longest static prefix, and for equal prefixes the longer key, independent of insertion order. The capture between prefix and suffix may contain slashes; every `*` in the selected target is replaced with that capture. String, conditions-object, and array targets go through the same resolver as exact keys.
+
+The exports boundary is retained: a selected null or unresolved target, or a request that matches no export, is a miss. It does not fall through to a less-specific pattern or to a plain file of the same name sitting next to `package.json`. Yarn PnP is still omitted — package `extends` under PnP walks `node_modules` instead.
 
 ## Prior art
 
@@ -108,10 +116,10 @@ Four TypeScript features path-alias resolution deliberately leaves alone, becaus
 
 ## Open questions
 
-Five points still open, most of them about how far tsconfig discovery should reach — into `node_modules`, through an `extends` that names an npm package — and how loudly a malformed config should fail.
+Four points still open, plus the settled package-`extends` answer. Most of the remainder is how far `paths` discovery should reach into `node_modules`, and how loudly a malformed config should fail.
 
 - **Should `paths` resolution fire for parents *inside* `node_modules`?** tsx skips it, on the rationale that published packages shouldn't depend on the consumer's tsconfig. Probably match it, after confirming that doesn't break monorepo setups where workspace packages reference each other via aliases.
-- **`extends` from an npm package** (`"extends": "@org/tsconfig/base"`) requires resolving the package via Node's resolver to find the actual tsconfig path. Adds one Node-resolver hop at tsconfig-load time. Cache the result.
+- **`extends` from an npm package** (`"extends": "@org/tsconfig/base"`). Settled: walk `node_modules`, honor `exports` (exact then single-star patterns, `require`/`types` conditions). An unresolved exports map does not fall through to a file on disk. PnP is still omitted.
 - **Comment syntax in tsconfig.** `tsconfig.json` is JSONC officially, per tsc docs; not all parsers handle it. Confirm `serde_json` plus a JSONC preprocessor (or the `jsonc-parser` crate) is the right setup.
 - **Performance of `extends` chain resolution.** Some real configs extend 3–4 levels deep across npm packages. Per-project one-time cost; should be sub-millisecond after first load.
 - **Should `paths` parse errors surface loudly?** A malformed `tsconfig.json` is a developer-facing problem, which argues for a clear error message rather than silently failing to resolve aliases.
@@ -134,3 +142,4 @@ Every revision to this document, with the date and what changed.
 
 - 2026-07-30 — Initial publication.
 - 2026-08-28 — Dropped a cross-reference to a withdrawn document.
+- 2026-09-14 — Documented package-export pattern matching for `extends` (exact key, then longest single-star prefix / longer key) and the exports short-circuit that refuses a filesystem fallback.

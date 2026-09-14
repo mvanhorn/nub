@@ -1904,6 +1904,82 @@ fn an_unreadable_tsconfig_stops_the_run() {
     );
 }
 
+/// #804: `extends: "pkg/ts/base"` against a wildcard-only `exports` map used to
+/// miss even when the JSON file existed, so the run either died on the missing
+/// config or continued without the base's `customConditions`. A condition that
+/// selects a distinguishable module is the proof the inherited config reached
+/// Node, not merely that the fatal gate stayed quiet.
+#[test]
+fn a_wildcard_package_export_extends_applies_inherited_custom_conditions() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path();
+    std::fs::create_dir_all(project.join("node_modules/cfg-pkg/ts")).unwrap();
+    std::fs::create_dir_all(project.join("node_modules/live-pkg")).unwrap();
+    std::fs::write(
+        project.join("package.json"),
+        r#"{ "type": "module", "dependencies": { "live-pkg": "*" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("tsconfig.json"),
+        r#"{ "extends": "cfg-pkg/ts/base" }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("node_modules/cfg-pkg/package.json"),
+        r#"{ "name": "cfg-pkg", "exports": { "./ts/*": "./ts/*.json" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("node_modules/cfg-pkg/ts/base.json"),
+        r#"{ "compilerOptions": { "customConditions": ["wild-extends"] } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("node_modules/live-pkg/package.json"),
+        r#"{ "type": "module", "exports": { ".": { "wild-extends": "./wild.js", "default": "./dist.js" } } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("node_modules/live-pkg/wild.js"),
+        "export default 'from-wild';\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("node_modules/live-pkg/dist.js"),
+        "export default 'from-dist';\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("main.mjs"),
+        "import which from 'live-pkg';\nconsole.log(which);\n",
+    )
+    .unwrap();
+
+    let output = Command::new(nub_binary())
+        .arg(project.join("main.mjs"))
+        .current_dir(project)
+        .env("XDG_CACHE_HOME", unique_test_cache())
+        .env("XDG_CONFIG_HOME", project.join("config"))
+        .output()
+        .expect("spawn nub");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "wildcard package extends must resolve: {stderr}"
+    );
+    assert_eq!(
+        stdout.trim(),
+        "from-wild",
+        "the base config's customConditions must reach Node: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("not found") && !stderr.contains("could not be read"),
+        "the missing-config diagnostic must stay absent: {stderr}"
+    );
+}
+
 // ── Project-source plain JS (.js/.mjs/.cjs) transpile ───────────────
 // nub transpiles PROJECT plain JS through the same pipeline as `.ts`, so
 // transformable syntax (`using`/`await using`, `v`-flag RegExp, decorators) lowers
