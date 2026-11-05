@@ -86,6 +86,28 @@ EOF
 	assert_output --partial "not found"
 }
 
+@test "aube store status checks configured virtual-store dependencies without CAS indices" {
+	unset AUBE_GLOBAL_VIRTUAL_STORE_DIR
+	printf 'global-virtual-store-dir=%s/custom-virtual-store\n' "$PWD" >>.npmrc
+	gvs="$PWD/custom-virtual-store/v1"
+	modules="$gvs/owner@1-graph/node_modules"
+	bundled="$modules/owner/node_modules/chalk/node_modules/supports-color"
+	mkdir -p "$bundled" "$gvs/has-flag@1-graph/node_modules/has-flag"
+	printf '{"dependencies":{"has-flag":"1"}}' >"$bundled/package.json"
+
+	run aube store status
+	assert_failure
+	assert_output --partial "owner@1-graph"
+	assert_output --partial "supports-color/package.json"
+	assert_output --partial "has-flag"
+
+	ln -s "$gvs/has-flag@1-graph/node_modules/has-flag" "$modules/has-flag"
+	run aube store status
+	assert_success
+	assert_output --partial "consistent"
+	assert_output --partial "no cached indices"
+}
+
 @test "aube store status detects a corrupted file" {
 	run aube store add is-odd@3.0.1
 	assert_success

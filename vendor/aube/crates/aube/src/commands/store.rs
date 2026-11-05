@@ -20,8 +20,9 @@
 //!   filesystems. `--dry-run` reports the same totals without deleting
 //!   anything.
 //! - `aube store status` — verify every file referenced by a cached package
-//!   index still exists in the store and its BLAKE3 hash matches. Exits 0
-//!   when everything is consistent, 1 when any corruption is found.
+//!   index still exists in the store and its BLAKE3 hash matches, and check
+//!   required dependency directories in published virtual-store graphs.
+//!   Exits non-zero when content or dependency verification fails.
 //!
 //! None of these subcommands touch `node_modules/`, the lockfile, or the
 //! project manifest, so they deliberately skip the project lock and the
@@ -70,11 +71,12 @@ pub enum StoreCommand {
     /// project reachability, so content-store pruning relies on cached package
     /// indexes. Global virtual-store reachability comes from project links.
     Prune(PruneCliArgs),
-    /// Verify the store against cached package indexes.
+    /// Verify cached content and required virtual-store dependencies.
     ///
     /// Confirms every file referenced by a cached package index is
     /// still present in the store and that its BLAKE3 hash matches.
-    /// Exits non-zero when any corruption is detected.
+    /// Also checks required dependency directories in each published graph.
+    /// Exits non-zero when corruption or missing dependencies are detected.
     Status,
 }
 
@@ -262,20 +264,8 @@ pub async fn run(args: StoreArgs) -> miette::Result<()> {
 /// against — `.npmrc` and `pnpm-workspace.yaml` discovery does not walk up, so
 /// anchoring at the nearest `package.json` made `store path` report the DEFAULT
 /// store from inside a workspace member while installs from that same member
-/// used the root's `store-dir` override. Real pnpm reports the override from
-/// both, so the narrower anchor was also a parity gap. Falls back to
-/// `project_root_or_cwd` so these commands still work outside a package tree,
-/// where the workspace walk-up has nothing to find.
-fn open_store() -> miette::Result<aube_store::Store> {
-    let cwd = crate::dirs::workspace_or_project_root()
-        .or_else(|_| crate::dirs::project_root_or_cwd())
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    crate::commands::open_store(&cwd)
-}
-
-/// Same WORKSPACE-root anchoring as [`open_store`], for the same reason:
-/// `path` and `prune` must resolve the store an install from a workspace
-/// member would use, not the default one.
+/// used the root's `store-dir` override. Falls back to `project_root_or_cwd`
+/// outside a package tree, where the workspace walk-up has nothing to find.
 fn open_store_for_maintenance() -> miette::Result<aube_store::Store> {
     let cwd = crate::dirs::workspace_or_project_root()
         .or_else(|_| crate::dirs::project_root_or_cwd())
@@ -386,9 +376,16 @@ fn referenced_hashes(index_dir: &Path) -> miette::Result<std::collections::HashS
 /// A missing index root is an empty cache; every other scan failure is fatal.
 fn visit_cached_indices(
     store: &aube_store::Store,
-    visit: impl FnMut(&Path, aube_store::PackageIndex),
+    mut visit: impl FnMut(&Path, aube_store::PackageIndex),
 ) -> miette::Result<()> {
-    visit_cached_indices_at(&store.index_dir(), visit)
+    let current = store.index_dir();
+    visit_cached_indices_at(&current, &mut visit)?;
+    // Maintenance opens do not migrate legacy indices; verify them in place.
+    let legacy = store.legacy_index_dir();
+    if legacy != current {
+        visit_cached_indices_at(&legacy, &mut visit)?;
+    }
+    Ok(())
 }
 
 fn visit_cached_indices_at(
@@ -1458,8 +1455,14 @@ fn json_path(path: std::path::PathBuf) -> String {
     path.to_string_lossy().into_owned()
 }
 
+// @lat: [[design/store-status]]
 fn status() -> miette::Result<()> {
-    let store = open_store()?;
+    let store = open_store_for_maintenance()?;
+    let _maintenance_lock = store
+        .lock_for_maintenance()
+        .into_diagnostic()
+        .map_err(|e| miette!("failed to lock the store for verification: {e}"))?;
+    let missing = verify_virtual_store(&store.virtual_store_dir())?;
     let mut checked = 0usize;
     let mut broken: Vec<String> = Vec::new();
     visit_cached_indices(&store, |path, index| {
@@ -1480,30 +1483,214 @@ fn status() -> miette::Result<()> {
         }
     })?;
 
-    if checked == 0 {
-        eprintln!("Store is consistent (no cached indices found)");
-        return Ok(());
+    // Findings go to stdout for piping; the summary goes to stderr.
+    for line in &broken {
+        println!("corrupt: {line}");
     }
-
-    if broken.is_empty() {
+    for line in &missing {
+        println!("missing dependency: {line}");
+    }
+    if !broken.is_empty() || !missing.is_empty() {
+        return Err(miette!(
+            "store contains {} corrupted {} and {} missing required dependencies",
+            broken.len(),
+            pluralizer::pluralize("file", broken.len() as isize, false),
+            missing.len()
+        ));
+    }
+    if checked == 0 {
         eprintln!(
-            "Store is consistent: {} verified",
+            "Store is consistent (no cached indices found; virtual-store dependencies verified)"
+        );
+    } else {
+        eprintln!(
+            "Store is consistent: {} verified; virtual-store dependencies verified",
             pluralizer::pluralize("package", checked as isize, true)
         );
-        Ok(())
-    } else {
-        // Corruption lines go to stdout so operators can pipe them into
-        // `wc -l`, `grep`, etc. while the summary/failure goes to stderr
-        // via miette. Mirrors how `store add` emits data on stdout.
-        for line in &broken {
-            println!("corrupt: {line}");
-        }
-        Err(miette!(
-            "store contains {} corrupted {}",
-            broken.len(),
-            pluralizer::pluralize("file", broken.len() as isize, false)
-        ))
     }
+    Ok(())
+}
+
+/// Manifests larger than this are refused. Same ceiling the resolver and
+/// publish paths use for a `package.json`, so status still accepts every
+/// manifest those paths accept.
+const MAX_STATUS_MANIFEST_BYTES: u64 = 8 << 20;
+
+/// Physical `node_modules` nesting under one published graph entry.
+/// Dependency symlinks are not descended; this only stops a real bundled
+/// directory chain from recursing without a bound.
+const MAX_STATUS_PACKAGE_DEPTH: usize = 64;
+
+/// Only walk physical installed package roots, never dependency symlinks or
+/// arbitrary source directories containing a package.json.
+fn verify_virtual_store(root: &Path) -> miette::Result<Vec<String>> {
+    let mut missing = Vec::new();
+    for entry in status_directories(root)? {
+        let name = entry.file_name().unwrap_or_default().to_string_lossy();
+        if !name.starts_with('.') && name != "node_modules" {
+            verify_package_modules(&entry.join("node_modules"), &entry, &mut missing, 0)?;
+        }
+    }
+    Ok(missing)
+}
+
+fn status_directories(dir: &Path) -> miette::Result<Vec<std::path::PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(miette!("failed to list {}: {e}", dir.display())),
+    };
+    let mut directories = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| miette!("failed to read {}: {e}", dir.display()))?;
+        let kind = entry
+            .file_type()
+            .map_err(|e| miette!("failed to inspect {}: {e}", entry.path().display()))?;
+        if kind.is_dir() {
+            directories.push(entry.path());
+        }
+    }
+    directories.sort();
+    Ok(directories)
+}
+
+fn verify_package_modules(
+    modules: &Path,
+    entry: &Path,
+    missing: &mut Vec<String>,
+    depth: usize,
+) -> miette::Result<()> {
+    // A symlinked node_modules must not turn this into a recursive graph walk.
+    match std::fs::symlink_metadata(modules) {
+        Ok(meta) if meta.file_type().is_symlink() => return Ok(()),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(miette!("failed to inspect {}: {e}", modules.display())),
+    }
+    if depth > MAX_STATUS_PACKAGE_DEPTH {
+        return Err(miette!(
+            "virtual-store package nesting exceeds {MAX_STATUS_PACKAGE_DEPTH} at {}",
+            modules.display()
+        ));
+    }
+    for package in status_directories(modules)? {
+        let name = package.file_name().unwrap_or_default().to_string_lossy();
+        if name.starts_with('.') {
+            continue;
+        }
+        if name.starts_with('@') {
+            for scoped in status_directories(&package)? {
+                verify_package_dependencies(&scoped, entry, missing, depth)?;
+            }
+        } else {
+            verify_package_dependencies(&package, entry, missing, depth)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read a manifest through [`aube_manifest::PackageJson`], bounded so a
+/// hostile file cannot be allocated whole. Absent manifests are skipped;
+/// anything else fails the status check with the path.
+fn read_status_manifest(path: &Path) -> miette::Result<Option<aube_manifest::PackageJson>> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(miette!("failed to read {}: {e}", path.display())),
+    };
+    let meta = file
+        .metadata()
+        .map_err(|e| miette!("failed to read {}: {e}", path.display()))?;
+    // `File::open` followed the path. A device or fifo can report a tiny
+    // length and then never end; only a regular file is a manifest.
+    if !meta.is_file() {
+        return Err(miette!(
+            "failed to read {}: not a regular file",
+            path.display()
+        ));
+    }
+    if meta.len() > MAX_STATUS_MANIFEST_BYTES {
+        return Err(miette!(
+            "failed to read {}: package.json exceeds {MAX_STATUS_MANIFEST_BYTES} bytes",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_STATUS_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| miette!("failed to read {}: {e}", path.display()))?;
+    if bytes.len() as u64 > MAX_STATUS_MANIFEST_BYTES {
+        return Err(miette!(
+            "failed to read {}: package.json exceeds {MAX_STATUS_MANIFEST_BYTES} bytes",
+            path.display()
+        ));
+    }
+    let content =
+        String::from_utf8(bytes).map_err(|e| miette!("failed to read {}: {e}", path.display()))?;
+    aube_manifest::PackageJson::parse(path, content)
+        .map(Some)
+        .map_err(miette::Report::new)
+}
+
+fn verify_package_dependencies(
+    package: &Path,
+    entry: &Path,
+    missing: &mut Vec<String>,
+    depth: usize,
+) -> miette::Result<()> {
+    let manifest = package.join("package.json");
+    if let Some(parsed) = read_status_manifest(&manifest)? {
+        for name in parsed.dependencies.keys() {
+            if parsed.optional_dependencies.contains_key(name) {
+                continue;
+            }
+            // Dependency keys are installed names, including npm aliases.
+            let parts: Vec<_> = name.split('/').collect();
+            if !((parts.len() == 1 && !name.starts_with('@'))
+                || (parts.len() == 2 && parts[0].starts_with('@') && parts[0].len() > 1))
+                || parts
+                    .iter()
+                    .any(|p| p.is_empty() || *p == "." || *p == ".." || p.contains('\\'))
+            {
+                return Err(miette!(
+                    "invalid dependency name {name:?} in {}",
+                    manifest.display()
+                ));
+            }
+            let mut found = false;
+            for ancestor in package.ancestors().take_while(|p| p.starts_with(entry)) {
+                if ancestor.file_name() == Some(std::ffi::OsStr::new("node_modules")) {
+                    continue;
+                }
+                let target = ancestor.join("node_modules").join(name);
+                match std::fs::metadata(&target) {
+                    Ok(meta) if meta.is_dir() => {
+                        found = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(miette!(
+                            "failed to inspect {} for {}: {e}",
+                            target.display(),
+                            manifest.display()
+                        ));
+                    }
+                }
+            }
+            if !found {
+                missing.push(format!(
+                    "entry {}: {} requires {name} (lookup from {})",
+                    entry.display(),
+                    manifest.display(),
+                    package.join("node_modules").join(name).display()
+                ));
+            }
+        }
+    }
+    verify_package_modules(&package.join("node_modules"), entry, missing, depth + 1)
 }
 
 /// Stream the file at `path` through BLAKE3 and compare to the expected
@@ -1518,6 +1705,161 @@ fn verify_stored_file(path: &Path, expected_hex: &str) -> bool {
     }
     let actual = hasher.finalize().to_hex().to_string();
     actual == expected_hex
+}
+
+#[cfg(all(test, unix))]
+mod status_link_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn checks_each_graph_and_bundled_package_without_following_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(verify_virtual_store(root).unwrap().is_empty());
+        assert!(
+            verify_virtual_store(&root.join("absent"))
+                .unwrap()
+                .is_empty()
+        );
+        for variant in ["owner@1-aaa", "owner@1-bbb"] {
+            let modules = root.join(variant).join("node_modules");
+            let bundled = modules.join("owner/node_modules/chalk/node_modules/supports-color");
+            std::fs::create_dir_all(&bundled).unwrap();
+            std::fs::write(bundled.join("package.json"),
+                r#"{"dependencies":{"has-flag":"1","optional":"1"},"optionalDependencies":{"optional":"1","optional-only":"1"},"peerDependencies":{"peer":"1"},"devDependencies":{"dev":"1"}}"#).unwrap();
+            std::fs::create_dir_all(modules.join("@scope/target")).unwrap();
+            std::fs::write(
+                modules.join("owner/package.json"),
+                r#"{"dependencies":{"@scope/target":"1","alias":"npm:target@1","bundled":"1"}}"#,
+            )
+            .unwrap();
+            symlink("@scope/target", modules.join("alias")).unwrap();
+            std::fs::create_dir_all(modules.join("owner/node_modules/bundled")).unwrap();
+            symlink(&modules, modules.join("@scope/target/node_modules")).unwrap();
+            // A source-tree manifest is not an installed package root.
+            std::fs::create_dir_all(modules.join("owner/examples")).unwrap();
+            std::fs::write(modules.join("owner/examples/package.json"), "invalid").unwrap();
+            symlink("@scope/target", modules.join("has-flag")).unwrap();
+        }
+        std::fs::create_dir_all(root.join(".tmp-entry/node_modules/bad")).unwrap();
+        std::fs::write(
+            root.join(".tmp-entry/node_modules/bad/package.json"),
+            "invalid",
+        )
+        .unwrap();
+        assert!(verify_virtual_store(root).unwrap().is_empty());
+
+        let modules = root.join("owner@1-bbb/node_modules");
+        std::fs::remove_file(modules.join("has-flag")).unwrap();
+        let missing = verify_virtual_store(root).unwrap();
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].contains("owner@1-bbb"));
+        assert!(missing[0].contains("supports-color/package.json"));
+        assert!(missing[0].contains("has-flag"));
+        symlink("absent", modules.join("has-flag")).unwrap();
+        assert_eq!(verify_virtual_store(root).unwrap().len(), 1);
+        // A real nested bundled directory is as valid as an ancestor link.
+        std::fs::create_dir_all(
+            modules
+                .join("owner/node_modules/chalk/node_modules/supports-color/node_modules/has-flag"),
+        )
+        .unwrap();
+        assert!(verify_virtual_store(root).unwrap().is_empty());
+
+        let manifest = modules.join("owner/package.json");
+        std::fs::write(&manifest, "invalid").unwrap();
+        assert!(
+            verify_virtual_store(root)
+                .unwrap_err()
+                .to_string()
+                .contains(&manifest.display().to_string())
+        );
+    }
+
+    #[test]
+    fn unreadable_entry_fails_with_its_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let entry = tmp.path().join("owner@1-aaa");
+        std::fs::create_dir_all(entry.join("node_modules")).unwrap();
+        std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0)).unwrap();
+        // Privileged runners can bypass permissions.
+        let inaccessible = std::fs::read_dir(&entry).is_err();
+        let result = verify_virtual_store(tmp.path());
+        std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if inaccessible {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&entry.display().to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn parser_accepted_manifests_are_checked_and_walks_stay_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let owner = root.join("owner@1-aaa/node_modules/owner");
+        std::fs::create_dir_all(&owner).unwrap();
+        // Leading BOM, a null dependency map, a non-string entry, and a
+        // duplicate `dependencies` key. The manifest parser keeps the last
+        // key and drops values that are not version strings.
+        std::fs::write(
+            owner.join("package.json"),
+            "\u{feff}{\"dependencies\":{\"skipped\":1},\"optionalDependencies\":null,\"dependencies\":{\"has-flag\":\"1\",\"also-bad\":{\"version\":\"1\"}},\"peerDependencies\":null}",
+        )
+        .unwrap();
+
+        let missing = verify_virtual_store(root).unwrap();
+        let owner_lines: Vec<_> = missing
+            .iter()
+            .filter(|line| line.contains("owner@1-aaa"))
+            .collect();
+        assert_eq!(owner_lines.len(), 1);
+        assert!(owner_lines[0].contains("has-flag"));
+        assert!(!owner_lines[0].contains("skipped"));
+        assert!(!owner_lines[0].contains("also-bad"));
+
+        // The cap still inspects a package, and one real directory past it
+        // fails the walk. Invoke the production walker at that depth so the
+        // fixture does not depend on PATH_MAX.
+        let entry = root.join("edge@1");
+        let modules = entry.join("node_modules");
+        let leaf = modules.join("leaf");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(
+            leaf.join("package.json"),
+            r#"{"dependencies":{"gone":"1"}}"#,
+        )
+        .unwrap();
+        let mut at_cap = Vec::new();
+        verify_package_modules(&modules, &entry, &mut at_cap, MAX_STATUS_PACKAGE_DEPTH).unwrap();
+        assert_eq!(at_cap.len(), 1);
+        assert!(at_cap[0].contains("gone"));
+        let too_deep = leaf.join("node_modules");
+        std::fs::create_dir_all(&too_deep).unwrap();
+        let err =
+            verify_package_modules(&modules, &entry, &mut Vec::new(), MAX_STATUS_PACKAGE_DEPTH)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains(&too_deep.display().to_string()));
+
+        let huge_root = tempfile::tempdir().unwrap();
+        let manifest = huge_root
+            .path()
+            .join("owner@1-aaa/node_modules/owner/package.json");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        let oversized = vec![b'{'; (MAX_STATUS_MANIFEST_BYTES + 1) as usize];
+        std::fs::write(&manifest, oversized).unwrap();
+        let err = verify_virtual_store(huge_root.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&manifest.display().to_string()));
+        assert!(err.contains("exceeds"));
+    }
 }
 
 #[cfg(all(test, unix))]
